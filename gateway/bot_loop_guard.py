@@ -33,6 +33,7 @@ class BotLoopGuardSettings:
     cooldown_seconds: float = 600.0
     max_hops: int = 4
     bot_replies_expect_reply: bool = False
+    admit_unreferenced_asks: bool = False
 
 
 def _as_bool(raw, default: bool) -> bool:
@@ -76,6 +77,7 @@ def settings_from_config(cfg) -> BotLoopGuardSettings:
         cooldown_seconds=_as_positive(block.get("cooldown_seconds"), defaults.cooldown_seconds),
         max_hops=_as_positive_int(block.get("max_hops"), defaults.max_hops),
         bot_replies_expect_reply=_as_bool(block.get("bot_replies_expect_reply"), defaults.bot_replies_expect_reply),
+        admit_unreferenced_asks=_as_bool(block.get("admit_unreferenced_asks"), defaults.admit_unreferenced_asks),
     )
 
 
@@ -157,7 +159,16 @@ class BotLoopGuard:
             events.append(now)
             return True, "ok"
 
-    def chain_admit(self, conversation: Hashable, sender: str, text: str, *, is_bot: bool) -> tuple[bool, str]:
+    def chain_admit(
+        self,
+        conversation: Hashable,
+        sender: str,
+        text: str,
+        *,
+        is_bot: bool,
+        reply_to_message_id: str | None = None,
+        supports_message_replies: bool = False,
+    ) -> tuple[bool, str]:
         """Apply the chain rules to one admitted inbound message. Returns ``(allowed, state)``; state is
         ``disabled``, ``human`` (chain reset), ``ok``, ``max_hops``, ``duplicate`` or ``reply_to_reply``."""
         settings = self._settings()
@@ -170,21 +181,26 @@ class BotLoopGuard:
                 self._chains.pop(conversation, None)
                 return True, "human"
             chain = self._chains.get(conversation)
-            if chain is None or now - chain.updated > settings.cooldown_seconds:
+            if chain is not None and now - chain.updated > settings.cooldown_seconds:
+                chain = None
+            ask = (sender, hashlib.sha256(" ".join(str(text or "").split()).encode()).hexdigest())
+            if chain is not None:
+                if ask in chain.asks:
+                    return False, "duplicate"
+                if not settings.bot_replies_expect_reply and chain.replied_to == sender:
+                    ref_id = str(reply_to_message_id) if reply_to_message_id is not None else None
+                    if not supports_message_replies or (ref_id and ref_id in chain.delivered_reply_ids) or not settings.admit_unreferenced_asks:
+                        return False, "reply_to_reply"
+                if chain.hops >= settings.max_hops:
+                    return False, "max_hops"
+            if chain is None:
                 chain = self._chains[conversation] = _Chain()
             chain.updated = now
-            ask = (sender, hashlib.sha256(" ".join(str(text or "").split()).encode()).hexdigest())
-            if ask in chain.asks:
-                return False, "duplicate"
-            if not settings.bot_replies_expect_reply and chain.replied_to == sender:
-                return False, "reply_to_reply"
-            if chain.hops >= settings.max_hops:
-                return False, "max_hops"
             chain.hops += 1
             chain.asks.add(ask)
             return True, "ok"
 
-    def note_reply(self, conversation: Hashable, recipient: str) -> None:
+    def note_reply(self, conversation: Hashable, recipient: str, message_id: str | None = None) -> None:
         """Record that this bot's reply to bot ``recipient`` went out. Only a delivered reply makes the
         recipient's next message an answer to an answer: a message still waiting for its turn, or one
         the turn chose to leave unanswered, does not."""
@@ -194,6 +210,8 @@ class BotLoopGuard:
             chain = self._chains.get(conversation)
             if chain is not None:
                 chain.replied_to = recipient
+                if message_id:
+                    chain.delivered_reply_ids.add(str(message_id))
 
     def _sweep(self, now: float, settings: BotLoopGuardSettings) -> None:
         """Drop idle conversations at most once per window so memory stays bounded."""
@@ -211,10 +229,11 @@ class BotLoopGuard:
 
 class _Chain:
     """One bot-to-bot exchange since the last human message in a conversation."""
-    __slots__ = ("asks", "hops", "replied_to", "updated")
+    __slots__ = ("asks", "delivered_reply_ids", "hops", "replied_to", "updated")
 
     def __init__(self) -> None:
         self.hops = 0
         self.asks: set[tuple[str, str]] = set()
         self.replied_to: str = ""
         self.updated = 0.0
+        self.delivered_reply_ids: set[str] = set()

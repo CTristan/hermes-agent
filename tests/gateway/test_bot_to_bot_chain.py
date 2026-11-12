@@ -117,3 +117,83 @@ def test_bot_users_marks_a_peer_on_a_platform_without_a_bot_flag():
     assert not configured_bot_user(config, HUMAN)
     assert configured_bot_user(SimpleNamespace(extra={"bot_users": "a,peer_bot"}), "peer_bot")
     assert not configured_bot_user(SimpleNamespace(extra={}), "peer_bot")
+
+
+def test_repeated_refused_asks_do_not_refresh_idle_clock(clock):
+    """Refused asks (duplicate, reply_to_reply, max_hops) must not update chain.updated."""
+    guard = _guard(clock, cooldown_seconds=600)
+    assert guard.chain_admit(CHAT, PEER, "initial ask", is_bot=True) == (True, "ok")
+    guard.note_reply(CHAT, PEER)
+
+    # 200s later, peer sends a refused reply_to_reply
+    clock.advance(200)
+    assert guard.chain_admit(CHAT, PEER, "thanks", is_bot=True) == (False, "reply_to_reply")
+
+    # Another 200s later (400s total), another refused message
+    clock.advance(200)
+    assert guard.chain_admit(CHAT, PEER, "still thanks", is_bot=True) == (False, "reply_to_reply")
+
+    # 201s later (601s since initial ask, but only 201s since last refused ask):
+    # The chain should have expired because refused asks did not advance chain.updated.
+    clock.advance(201)
+    assert guard.chain_admit(CHAT, PEER, "new ask after expiry", is_bot=True) == (True, "ok")
+
+
+def test_delivered_reply_tracking_and_reference_inversion_on_capable_platforms(clock):
+    """On reference-capable platforms with admit_unreferenced_asks, unreferenced top-level asks
+    are admitted as new asks, while explicit replies to delivered replies are dropped (#151224)."""
+    guard = _guard(clock, admit_unreferenced_asks=True)
+    # Hop 1: Peer sends top-level ask 1
+    assert guard.chain_admit(
+        CHAT, PEER, "task 1", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+    ) == (True, "ok")
+    guard.note_reply(CHAT, PEER, message_id="reply_msg_101")
+
+    # An explicit reply quoting our reply is dropped
+    assert guard.chain_admit(
+        CHAT, PEER, "thank you!", is_bot=True, supports_message_replies=True, reply_to_message_id="reply_msg_101"
+    ) == (False, "reply_to_reply")
+
+    # A new top-level ask without reply reference is admitted as a new ask (Hop 2)
+    assert guard.chain_admit(
+        CHAT, PEER, "task 2 (correction)", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+    ) == (True, "ok")
+
+    # A message replying to someone else's message is also admitted as a new ask (Hop 3)
+    assert guard.chain_admit(
+        CHAT, PEER, "task 3 (re: other)", is_bot=True, supports_message_replies=True, reply_to_message_id="other_msg_999"
+    ) == (True, "ok")
+
+
+def test_unsupported_or_disabled_platforms_keep_conservative_drop(clock):
+    """Platforms lacking per-message replies (Slack) or with admit_unreferenced_asks=False keep conservative drop."""
+    # When admit_unreferenced_asks is False (default), even reference-capable platforms drop top-level asks
+    default_guard = _guard(clock, admit_unreferenced_asks=False)
+    assert default_guard.chain_admit(CHAT, PEER, "q1", is_bot=True, supports_message_replies=True) == (True, "ok")
+    default_guard.note_reply(CHAT, PEER, message_id="rep1")
+    assert default_guard.chain_admit(
+        CHAT, PEER, "q2", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+    ) == (False, "reply_to_reply")
+
+    # When supports_message_replies is False (e.g. Slack), conservative drop applies regardless of setting
+    slack_guard = _guard(clock, admit_unreferenced_asks=True)
+    assert slack_guard.chain_admit(CHAT, PEER, "q1", is_bot=True, supports_message_replies=False) == (True, "ok")
+    slack_guard.note_reply(CHAT, PEER, message_id="rep1")
+    assert slack_guard.chain_admit(
+        CHAT, PEER, "q2", is_bot=True, supports_message_replies=False, reply_to_message_id=None
+    ) == (False, "reply_to_reply")
+
+
+def test_alternating_fresh_worded_top_level_asks_terminate_at_max_hops(clock):
+    """Freshly worded top-level asks under admit_unreferenced_asks cannot loop infinitely; they terminate at max_hops."""
+    guard = _guard(clock, max_hops=4, admit_unreferenced_asks=True)
+    for n in range(1, 5):
+        assert guard.chain_admit(
+            CHAT, PEER, f"fresh ask {n}", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+        ) == (True, "ok")
+        guard.note_reply(CHAT, PEER, message_id=f"rep_{n}")
+
+    # Hop 5 exceeds max_hops (4)
+    assert guard.chain_admit(
+        CHAT, PEER, "fresh ask 5", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+    ) == (False, "max_hops")

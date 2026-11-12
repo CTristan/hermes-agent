@@ -46,3 +46,16 @@ def test_max_hops_from_config_yaml_caps_bot_mode_sends(config_home, monkeypatch)
     reply = bot_chain.admit_send(agent, ["bot:alpha"], "answer")
     assert reply.refusal is None and reply.notify_only == {"bot:alpha"}  # bot_replies_expect_reply: false
     assert "limit of 2" in str(bot_chain.admit_send(agent, ["bot:gamma"], "next").refusal)
+
+
+def test_admit_unreferenced_asks_from_config_yaml(config_home):
+    config_home({"admit_unreferenced_asks": True})
+    assert load_settings().admit_unreferenced_asks is True
+
+    guard = BotLoopGuard()
+    assert guard.chain_admit("chat", "peer", "q1", is_bot=True, supports_message_replies=True) == (True, "ok")
+    guard.note_reply("chat", "peer", message_id="rep1")
+    # With admit_unreferenced_asks: true, a top-level unreferenced ask is admitted
+    assert guard.chain_admit(
+        "chat", "peer", "q2", is_bot=True, supports_message_replies=True, reply_to_message_id=None
+    ) == (True, "ok")

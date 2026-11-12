@@ -1805,22 +1805,19 @@ class BasePlatformAdapter(ABC):
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
     supports_code_blocks: bool = False
-    # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
+    supports_message_replies: bool = False
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
-        next typing refresh renders it; a no-op store on adapters that never read
-        ``_status_text``."""
+        next typing refresh renders it; a no-op store on adapters that never read ``_status_text``."""
         store = _lazy_attr(self, "_status_text", dict)
         if text:
             store[str(chat_id)] = text
         else:
             store.pop(str(chat_id), None)
 
-    # Can wake a fresh turn AFTER a turn ends (detached-subagent completions); False for stateless
-    # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
-    # a delivery they can't keep.
+    # Can wake a fresh turn AFTER a turn ends (detached-subagent completions); False for stateless adapters.
     supports_async_delivery: bool = True
     # ``send()`` chunks natively via ``truncate_message()`` -> the router skips its truncation.
     splits_long_messages: bool = False
@@ -4307,6 +4304,9 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
+        if result.success and result.message_id and getattr(event.source, "is_bot", False):
+            if hasattr(self.gateway_runner, "_note_bot_reply"):
+                self.gateway_runner._note_bot_reply(event.source, message_id=str(result.message_id))
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
